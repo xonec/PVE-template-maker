@@ -78,7 +78,8 @@ prompt_vm_params(){
 # 磁盘命名处理：确保磁盘名称不包含非法字符
 sanitize_disk_name() {
   local disk_name="$1"
-  echo "${disk_name//\//-}"  # 替换所有斜杠（/）为横杠（-）
+  # 替换所有斜杠（/）为横杠（-）并去掉 .qcow2 后缀
+  echo "${disk_name//\//-}" | sed 's/\.qcow2$//'
 }
 
 download_image(){
