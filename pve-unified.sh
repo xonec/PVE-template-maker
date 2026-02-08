@@ -143,6 +143,7 @@ create_vm_single(){
     --cpu host \
     --cores 2 \
     --memory 2048 \
+    --sata0 "$STORAGE:20" \
     --scsihw virtio-scsi-pci \
     --agent 1 \
     --net0 virtio,bridge="$VMBR" || {
@@ -154,12 +155,12 @@ create_vm_single(){
     log_err "导入磁盘失败"; exit 1;
   }
 
-  log_info "配置 SCSI 磁盘 (20G) 和 CloudInit 双栈 DHCP"
-  disk_name=$(sanitize_disk_name "$VMID-vm-$VMID-disk-0.qcow2")
-  sudo qm set "$VMID" --scsi0 "$STORAGE:$disk_name" || {
-    log_err "挂载 scsi0 失败"; exit 1;
+  log_info "配置 SATA 磁盘 (20G) 和 CloudInit 双栈 DHCP"
+  disk_name=$(sanitize_disk_name "$VMID-vm-$VMID-disk-0")
+  sudo qm set "$VMID" --sata0 "$STORAGE:$disk_name" || {
+    log_err "挂载 SATA 磁盘失败"; exit 1;
   }
-  sudo qm resize "$VMID" scsi0 20G || {
+  sudo qm resize "$VMID" sata0 20G || {
     log_err "调整磁盘大小失败"; exit 1;
   }
 
@@ -170,7 +171,7 @@ create_vm_single(){
     log_err "配置 IP 为双栈 DHCP 失败"; exit 1;
   }
 
-  sudo qm set "$VMID" --boot c --bootdisk scsi0
+  sudo qm set "$VMID" --boot c --bootdisk sata0
   sudo qm set "$VMID" --serial0 socket --vga serial0
   sudo qm set "$VMID" --description "$NOTES_TEXT"
 
