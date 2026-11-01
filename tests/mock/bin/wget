@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# mock `wget` for PVE template tests.
+#
+# Download behaviour is driven by $MOCK_STATE/wget_mode:
+#   ok      - write a small fake qcow2 (first 4 bytes "QFI\xfb") and succeed
+#   fail    - print a wget-style network error and exit 4
+#   partial - write a truncated file and exit 4 (simulates a dropped transfer)
+# The downloaded URL and every option are recorded in $MOCK_STATE/calls.log.
+# No network access is ever performed.
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call wget "$@"
+
+outfile=""
+url=""
+mode=ok
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -q|--quiet|--no-verbose) shift ;;
+    -qO-|-O-|--output-document=-) outfile="-"; shift ;;
+    -qO*) outfile="${1#-qO}"; shift ;;
+    -O) outfile="${2-}"; shift 2 ;;
+    --output-document) outfile="${2-}"; shift 2 ;;
+    --output-document=*) outfile="${1#--output-document=}"; shift ;;
+    -O*) outfile="${1#-O}"; shift ;;
+    --show-progress|--progress=*|--no-check-certificate|--no-cookies|--no-hsts)
+      shift
+      ;;
+    -c|--continue|-4|-6|--inet4-only|--inet6-only) shift ;;
+    --tries=*|--timeout=*|--read-timeout=*|--waitretry=*|--user-agent=*) shift ;;
+    -t|--tries|--timeout|--read-timeout|--waitretry|-U|--user-agent)
+      shift 2
+      ;;
+    --header=*) shift ;;
+    --header|-H) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+
+target="$outfile"
+if [ -z "$target" ]; then
+  # real wget stores to a local file named after the URL when -O is omitted
+  target="${url##*/}"
+  [ -n "$target" ] || target="index.html"
+fi
+[ -n "$url" ] || mock_fail "wget: missing URL" 1
+
+mode=$(file_get "$MOCK_STATE/wget_mode" ok)
+
+write_image() { # target: "-" means stdout, otherwise a file path
+  local t="$1" payload
+  payload='pve-mock-qcow2 image payload'
+  if [ "$t" = "-" ]; then
+    printf 'QFI\373'
+    printf '%s\n' "$payload"
+    dd if=/dev/zero bs=1024 count=4 2>/dev/null || true
+  else
+    local parent
+    parent=$(dirname "$t")
+    if [ ! -d "$parent" ]; then
+      mock_fail "wget: can't open '$t': No such file or directory" 3
+    fi
+    {
+      printf 'QFI\373'
+      printf '%s\n' "$payload"
+      dd if=/dev/zero bs=1024 count=4 2>/dev/null || true
+    } > "$t" || mock_fail "wget: can't write to '$t': No such file or directory" 3
+  fi
+}
+
+case "$mode" in
+  fail)
+    printf "wget: unable to resolve host address '%s'\n" "$(printf '%s' "$url" | sed 's|^[a-z]*://||; s|/.*||')" >&2
+    exit 4
+    ;;
+  partial)
+    if [ "$target" = "-" ]; then
+      printf 'QFI\373'
+    else
+      { printf 'QFI\373'; printf 'truncated'; } > "$target" 2>/dev/null || true
+    fi
+    printf "wget: connection closed at byte 128 - retrying\n" >&2
+    exit 4
+    ;;
+  *)
+    write_image "$target"
+    printf '%s  100%%[===================>]  16.00M  --.-KB/s    in 0s\n' "${url##*/}" >&2
+    exit 0
+    ;;
+esac

@@ -1,0 +1,4 @@
+# Tests intentionally share globals across files: run.sh sources lib/framework.sh,
+# lib/scene.sh and each cases/*.sh case file at runtime, which shellcheck cannot
+# follow.  The "appears unused" warnings are therefore false positives.
+disable=SC2034

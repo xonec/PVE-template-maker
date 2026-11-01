@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# mock `sudo`: log the wrapped invocation, then exec it verbatim.
+# Tests run as the current user; PVE's root check is mocked through `id`.
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call sudo "$@"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    -u|--user|-g|--group|-p|--prompt|-C|-h|--host|-T|--command-timeout|-r|--role|-t|--type)
+      shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+
+[ $# -gt 0 ] || mock_usage "sudo <command> [args]"
+exec "$@"

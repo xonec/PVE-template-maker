@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+# mock `qm` for PVE template tests -- reads/writes $MOCK_STATE, logs every call.
+#
+# Supported: list, config, create, set, importdisk, resize, start, stop,
+# shutdown, destroy, template, clone, status, guest cmd, guest ping, unlock.
+# Outputs use the real PVE style (table headers, "key: value" config, compact
+# JSON for --output-format json, pretty JSON with " : " separators for the
+# qemu-guest-agent output).
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call qm "$@"
+
+sub="$1"
+[ -n "$sub" ] || mock_usage "qm <command> [args]"
+shift
+
+# ---------------------------------------------------------------------------
+# guest interface JSON (PVE prints Cpanel::JSON::XS pretty style: 3-space
+# indent and "key" : value -- pve-unified.sh relies on exactly that spacing)
+# ---------------------------------------------------------------------------
+guest_iface_lo() {
+  printf '   {\n'
+  printf '      "name" : "lo",\n'
+  printf '      "ip-addresses" : [\n'
+  printf '         {\n'
+  printf '            "ip-address-type" : "ipv4",\n'
+  printf '            "ip-address" : "127.0.0.1",\n'
+  printf '            "prefix" : 8\n'
+  printf '         },\n'
+  printf '         {\n'
+  printf '            "ip-address-type" : "ipv6",\n'
+  printf '            "ip-address" : "::1",\n'
+  printf '            "prefix" : 128\n'
+  printf '         }\n'
+  printf '      ],\n'
+  printf '      "hardware-address" : "00:00:00:00:00:00"\n'
+  printf '   }'
+}
+
+guest_iface_eth() { # name ip
+  printf '   {\n'
+  printf '      "name" : "%s",\n' "$1"
+  printf '      "ip-addresses" : [\n'
+  printf '         {\n'
+  printf '            "ip-address-type" : "ipv4",\n'
+  printf '            "ip-address" : "%s",\n' "$2"
+  printf '            "prefix" : 24\n'
+  printf '         },\n'
+  printf '         {\n'
+  printf '            "ip-address-type" : "ipv6",\n'
+  printf '            "ip-address" : "fe80::be24:11ff:fe12:3456",\n'
+  printf '            "prefix" : 64\n'
+  printf '         }\n'
+  printf '      ],\n'
+  printf '      "hardware-address" : "aa:bb:cc:dd:ee:ff"\n'
+  printf '   }'
+}
+
+guest_network_interfaces() { # vmid mode
+  local id="$1" mode="$2" ip
+  ip=$(mock_vm_attr "$id" guest_ip "10.0.0.10")
+  printf '[\n'
+  guest_iface_lo
+  if [ "$mode" = "docker" ]; then
+    printf ',\n'
+    guest_iface_eth "eth0" "$ip"
+    printf ',\n'
+    guest_iface_eth "docker0" "172.17.0.1"
+    printf ',\n'
+    guest_iface_eth "tailscale0" "100.64.0.2"
+  else
+    printf ',\n'
+    guest_iface_eth "eth0" "$ip"
+  fi
+  printf '\n]\n'
+}
+
+# ---------------------------------------------------------------------------
+qm_list() {
+  local format="table" a id name status mem boot pid cpus maxmem
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --output-format) format="${2:-json}"; shift 2 ;;
+      --output-format=*) format="${1#--output-format=}"; shift ;;
+      --full|--verbose) shift ;;
+      *) shift ;;
+    esac
+  done
+  if [ "$format" = "json" ]; then
+    printf '['
+    local first=1 uptime pidj memj
+    for id in $(mock_vm_ids); do
+      name=$(mock_vm_attr "$id" name "")
+      status=$(mock_vm_attr "$id" status stopped)
+      mem=$(mock_vm_attr "$id" mem 512)
+      boot=$(mock_vm_attr "$id" bootdisk_bytes 0)
+      cpus=$(conf_get "$(mock_vm_conf "$id")" cores 1)
+      maxmem=$((mem * 1048576))
+      [ "$status" = "running" ] && { memj="$maxmem"; uptime=3600; } || { memj=0; uptime=0; }
+      [ "$first" = 1 ] || printf ','
+      first=0
+      printf '{"vmid":%s,"name":"%s","status":"%s","mem":%s,"maxmem":%s,"disk":0,"maxdisk":%s,"cpu":0,"cpus":%s,"uptime":%s}' \
+        "$id" "$(json_escape "$name")" "$status" "$memj" "$maxmem" "$boot" "$cpus" "$uptime"
+    done
+    printf ']\n'
+    return 0
+  fi
+  printf '%10s %-20s %-10s %9s %14s %s\n' "VMID" "NAME" "STATUS" "MEM(MB)" "BOOTDISK(GB)" "PID"
+  for id in $(mock_vm_ids); do
+    name=$(mock_vm_attr "$id" name "")
+    status=$(mock_vm_attr "$id" status stopped)
+    mem=$(mock_vm_attr "$id" mem 512)
+    boot=$(mock_vm_attr "$id" bootdisk_bytes 0)
+    if [ "$status" = "running" ]; then pid=$(mock_vm_attr "$id" pid 0); else pid=0; fi
+    boot=$(awk -v b="$boot" 'BEGIN { printf "%.2f", b / 1073741824 }')
+    printf '%10s %-20s %-10s %9s %14s %s\n' "$id" "$name" "$status" "$mem" "$boot" "$pid"
+  done
+}
+
+qm_config() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "qm config <vmid>"
+  mock_require_vm "$id"
+  cat "$(mock_vm_conf "$id")"
+}
+
+qm_validate_volume() { # key value
+  local key="$1" value="$2" store
+  case "$key" in
+    scsi[0-9]*|sata[0-9]*|virtio[0-9]*|ide[0-9]*|efidisk0|tpmstate0)
+      [ -z "$value" ] || [ "$value" = "none" ] && return 0
+      case "$value" in
+        *:*) store="${value%%:*}" ;;
+        *) return 0 ;;
+      esac
+      mock_require_storage "$store"
+      ;;
+    net[0-9]*)
+      printf '%s' "$value" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_,=.:+-]*$' ||
+        mock_fail "invalid format - value does not look like a valid network interface" 255
+      ;;
+  esac
+  return 0
+}
+
+qm_create() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "qm create <vmid> --options"
+  shift
+  case "$id" in
+    *[!0-9]*) mock_fail "invalid VMID '$id'" 255 ;;
+  esac
+  if [ -d "$(mock_vm_dir "$id")" ]; then
+    mock_fail "VM $id already exists" 2
+  fi
+  # validate every option before touching the state, like PVE does
+  local keys=() vals=() key value name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --*)
+        key="${1#--}"
+        shift
+        [ $# -gt 0 ] || mock_fail "missing value for --$key" 255
+        value="$1"
+        shift
+        ;;
+      *) mock_fail "too many arguments" 255 ;;
+    esac
+    qm_validate_volume "$key" "$value"
+    case "$key" in
+      tags) value=$(pve_normalize_tags "$value") ;;
+      memory|cores|balloon)
+        case "$value" in
+          *[!0-9]*) mock_fail "invalid format - $value" 255 ;;
+        esac
+        ;;
+    esac
+    keys[${#keys[@]}]="$key"
+    vals[${#vals[@]}]="$(printf '%s' "$value" | conf_encode)"
+  done
+  mkdir -p "$(mock_vm_dir "$id")"
+  mock_vm_attr_put "$id" status stopped
+  mock_vm_attr_put "$id" pid 0
+  mock_vm_attr_put "$id" mem 512
+  mock_vm_attr_put "$id" bootdisk_bytes 0
+  local i=0
+  while [ "$i" -lt "${#keys[@]}" ]; do
+    key="${keys[$i]}"
+    value="${vals[$i]}"
+    conf_set "$(mock_vm_conf "$id")" "$key" "$value"
+    case "$key" in
+      name) name="$value" ;;
+      memory) mock_vm_attr_put "$id" mem "$value" ;;
+      cores) : ;;
+    esac
+    i=$((i + 1))
+  done
+  mock_vm_attr_put "$id" name "$name"
+  return 0
+}
+
+qm_set() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "qm set <vmid> --options"
+  shift
+  mock_require_vm "$id"
+  local conf
+  conf=$(mock_vm_conf "$id")
+  # validate every option before touching the state, like PVE does
+  local kinds=() keys=() vals=() kind="" key value
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --delete)
+        shift
+        [ $# -gt 0 ] || mock_fail "missing value for --delete" 255
+        kinds[${#kinds[@]}]="delete"
+        keys[${#keys[@]}]="$1"
+        vals[${#vals[@]}]=""
+        shift
+        ;;
+      --*)
+        key="${1#--}"
+        shift
+        [ $# -gt 0 ] || mock_fail "missing value for --$key" 255
+        value="$1"
+        shift
+        qm_validate_volume "$key" "$value"
+        [ "$key" = "tags" ] && value=$(pve_normalize_tags "$value")
+        kinds[${#kinds[@]}]="set"
+        keys[${#keys[@]}]="$key"
+        vals[${#vals[@]}]="$(printf '%s' "$value" | conf_encode)"
+        ;;
+      *) mock_fail "too many arguments" 255 ;;
+    esac
+  done
+  local i=0 match
+  while [ "$i" -lt "${#keys[@]}" ]; do
+    kind="${kinds[$i]}"
+    key="${keys[$i]}"
+    value="${vals[$i]}"
+    if [ "$kind" = "delete" ]; then
+      conf_del "$conf" "$key"
+    else
+      conf_set "$conf" "$key" "$value"
+      case "$key" in
+        scsi[0-9]*|sata[0-9]*|virtio[0-9]*)
+          # assigning an imported unusedN volume drops the unusedN entry, like PVE
+          match=$(awk -v v="$value" '
+            /^unused[0-9]+:/ {
+              line = $0
+              sub(/^unused[0-9]+: /, "", line)
+              if (line == v) { k = $1; sub(/:$/, "", k); print k; exit }
+            }' "$conf")
+          [ -n "$match" ] && conf_del "$conf" "$match"
+          ;;
+        memory) mock_vm_attr_put "$id" mem "$value" ;;
+        name) mock_vm_attr_put "$id" name "$value" ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
+  return 0
+}
+
+qm_importdisk_help() {
+  local modern
+  modern=$(file_get "$MOCK_STATE/qm_importdisk_target_disk" 1)
+  printf 'usage: qm importdisk <vmid> <source> <storage> [OPTIONS]\n\n'
+  printf 'Imports a disk image to a VM.\n\n'
+  printf 'Options:\n'
+  printf '  --format <raw|qcow2|vmdk>   Import format\n'
+  if [ "$modern" != "0" ]; then
+    printf '  --target-disk <disk>        Import directly to the given bus/disk (scsi0 ...)\n'
+  fi
+}
+
+qm_importdisk() {
+  if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    qm_importdisk_help
+    return 0
+  fi
+  local id="${1:-}" src="${2:-}" store="${3:-}"
+  [ -n "$id" ] && [ -n "$src" ] && [ -n "$store" ] ||
+    mock_usage "qm importdisk <vmid> <source> <storage> [--format fmt] [--target-disk disk]"
+  shift 3
+  local target="" key value
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --format) key="format"; shift; [ $# -gt 0 ] || mock_fail "missing value for --format" 255; value="$1"; shift ;;
+      --target-disk) target="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  mock_require_vm "$id"
+  mock_require_storage "$store"
+  if [ ! -f "$src" ]; then
+    mock_fail "Could not open '$src': No such file or directory" 2
+  fi
+  local volid
+  volid="$store:vm-$id-disk-0"
+  printf "importing disk '%s' to VM %s ...\n" "$src" "$id"
+  if [ -n "$target" ]; then
+    conf_set "$(mock_vm_conf "$id")" "$target" "$volid"
+    printf "Successfully imported disk as '%s:%s'\n" "$target" "$volid"
+    return 0
+  fi
+  local next
+  next=$(mock_next_unused_index "$id")
+  conf_set "$(mock_vm_conf "$id")" "unused$next" "$volid"
+  printf "Successfully imported disk as 'unused%s:%s'\n" "$next" "$volid"
+}
+
+qm_resize() {
+  local id="${1:-}" disk="${2:-}" size="${3:-}"
+  [ -n "$id" ] && [ -n "$disk" ] && [ -n "$size" ] ||
+    mock_usage "qm resize <vmid> <disk> <size>"
+  mock_require_vm "$id"
+  local conf value
+  conf=$(mock_vm_conf "$id")
+  value=$(conf_get "$conf" "$disk")
+  if [ -z "$value" ]; then
+    mock_fail "disk '$disk' does not exist on VM $id" 255
+  fi
+  case ",$value," in
+    *",size="*) : ;;
+    *) conf_set "$conf" "$disk" "$value,size=$size" ;;
+  esac
+  mock_vm_attr_put "$id" bootdisk_bytes "$(size_to_bytes "$size")"
+  return 0
+}
+
+qm_start() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "qm start <vmid>"
+  mock_require_vm "$id"
+  if [ -f "$MOCK_STATE/qm_fail_start" ]; then
+    mock_fail "start failed: kvm: VM $id failed to start (mock)" 1
+  fi
+  if [ "$(mock_vm_status "$id")" = "running" ]; then
+    mock_fail "VM $id already running" 2
+  fi
+  mock_vm_attr_put "$id" status running
+  mock_vm_attr_put "$id" pid "$((100000 + id % 90000))"
+  return 0
+}
+
+qm_stop() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "qm stop <vmid>"
+  mock_require_vm "$id"
+  if [ "$(mock_vm_status "$id")" != "running" ]; then
+    mock_fail "VM $id not running" 2
+  fi
+  mock_vm_attr_put "$id" status stopped
+  mock_vm_attr_put "$id" pid 0
+  return 0
+}
+
+qm_shutdown() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "qm shutdown <vmid>"
+  mock_require_vm "$id"
+  mock_vm_attr_put "$id" status stopped
+  mock_vm_attr_put "$id" pid 0
+  return 0
+}
+
+qm_destroy() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "qm destroy <vmid>"
+  mock_require_vm "$id"
+  rm -rf "$(mock_vm_dir "$id")"
+  return 0
+}
+
+qm_template() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "qm template <vmid>"
+  mock_require_vm "$id"
+  mock_vm_attr_put "$id" template 1
+  conf_set "$(mock_vm_conf "$id")" template 1
+  return 0
+}
+
+qm_clone() {
+  local src="${1:-}" newid="${2:-}"
+  [ -n "$src" ] && [ -n "$newid" ] || mock_usage "qm clone <vmid> <newid> [--name name]"
+  shift 2
+  mock_require_vm "$src"
+  if [ -d "$(mock_vm_dir "$newid")" ]; then
+    mock_fail "VM $newid already exists" 2
+  fi
+  local name
+  name=$(mock_vm_attr "$src" name "clone-$newid")
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="${2:-$name}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  mkdir -p "$(mock_vm_dir "$newid")"
+  if [ -f "$(mock_vm_conf "$src")" ]; then
+    sed -e "s/vm-$src-disk-/vm-$newid-disk-/g" "$(mock_vm_conf "$src")" \
+      | awk 'BEGIN { p = "template: " } index($0, p) != 1 { print }' \
+      > "$(mock_vm_conf "$newid")"
+    conf_set "$(mock_vm_conf "$newid")" name "$name"
+  fi
+  mock_vm_attr_put "$newid" name "$name"
+  mock_vm_attr_put "$newid" status stopped
+  mock_vm_attr_put "$newid" pid 0
+  mock_vm_attr_put "$newid" mem "$(mock_vm_attr "$src" mem 512)"
+  mock_vm_attr_put "$newid" bootdisk_bytes "$(mock_vm_attr "$src" bootdisk_bytes 0)"
+  rm -f "$(mock_vm_dir "$newid")/template"
+  return 0
+}
+
+qm_status() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "qm status <vmid> [--output-format json]"
+  shift
+  mock_require_vm "$id"
+  local format="text" status
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --output-format) format="${2:-json}"; shift 2 ;;
+      --output-format=*) format="${1#--output-format=}"; shift ;;
+      *) shift ;;
+    esac
+  done
+  status=$(mock_vm_status "$id")
+  if [ "$format" = "json" ]; then
+    printf '{"status":"%s"}\n' "$status"
+  else
+    printf 'status: %s\n' "$status"
+  fi
+}
+
+qm_guest() {
+  local sub="${1:-}"
+  shift 2>/dev/null || true
+  case "$sub" in
+    cmd)
+      local id="${1:-}" cmd="${2:-}"
+      [ -n "$id" ] && [ -n "$cmd" ] || mock_usage "qm guest cmd <vmid> <command>"
+      mock_require_vm "$id"
+      if [ "$(mock_vm_status "$id")" != "running" ]; then
+        mock_fail "VM $id is not running" 1
+      fi
+      local mode
+      mode=$(mock_vm_attr "$id" guest_mode normal)
+      if [ "$mode" = "no-agent" ] || [ "$mode" = "stopped" ]; then
+        mock_fail "Guest agent is not running - VM $id qmp command '$cmd' failed - got timeout" 1
+      fi
+      case "$cmd" in
+        network-get-interfaces) guest_network_interfaces "$id" "$mode" ;;
+        *) printf '{}\n' ;;
+      esac
+      ;;
+    ping)
+      local id="${1:-}"
+      [ -n "$id" ] || mock_usage "qm guest ping <vmid>"
+      mock_require_vm "$id"
+      if [ "$(mock_vm_status "$id")" != "running" ]; then
+        mock_fail "VM $id is not running" 1
+      fi
+      if [ "$(mock_vm_attr "$id" guest_mode normal)" = "no-agent" ]; then
+        mock_fail "Guest agent is not running - VM $id" 1
+      fi
+      return 0
+      ;;
+    *) mock_fail "unknown guest command '$sub'" 255 ;;
+  esac
+}
+
+qm_unlock() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "qm unlock <vmid>"
+  mock_require_vm "$id"
+  return 0
+}
+
+case "$sub" in
+  list) qm_list "$@" ;;
+  config) qm_config "$@" ;;
+  create) qm_create "$@" ;;
+  set) qm_set "$@" ;;
+  importdisk) qm_importdisk "$@" ;;
+  resize) qm_resize "$@" ;;
+  start) qm_start "$@" ;;
+  stop) qm_stop "$@" ;;
+  shutdown) qm_shutdown "$@" ;;
+  destroy) qm_destroy "$@" ;;
+  template) qm_template "$@" ;;
+  clone) qm_clone "$@" ;;
+  status) qm_status "$@" ;;
+  guest) qm_guest "$@" ;;
+  unlock) qm_unlock "$@" ;;
+  *) mock_fail "unknown command '$sub'" 255 ;;
+esac

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# mock `timeout` (v2 readiness): parses GNU coreutils options and runs the
+# wrapped command immediately without enforcing the timeout (the test runner
+# has its own per-case watchdog).
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call timeout "$@"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    -k|--kill-after|-s|--signal) shift 2 ;;
+    --kill-after=*|--signal=*) shift ;;
+    -v|--verbose|--preserve-status|--foreground) shift ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+[ $# -gt 0 ] || mock_usage "timeout [OPTION] DURATION COMMAND [ARG]..."
+shift
+[ $# -gt 0 ] || mock_usage "timeout: missing command"
+exec "$@"

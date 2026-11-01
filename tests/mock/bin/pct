@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# mock `pct` for PVE template tests.
+#
+# Supported: list (table + json), config, exec, set, status, start, stop.
+# `pct exec <ctid> -- ip -4 addr show` prints realistic container networking
+# so pve-unified.sh can extract the container IP from it.
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call pct "$@"
+
+sub="$1"
+[ -n "$sub" ] || mock_usage "pct <command> [args]"
+shift
+
+pct_list() {
+  local format="table" id name status first
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --output-format) format="${2:-json}"; shift 2 ;;
+      --output-format=*) format="${1#--output-format=}"; shift ;;
+      *) shift ;;
+    esac
+  done
+  if [ "$format" = "json" ]; then
+    printf '['
+    first=1
+    for id in $(mock_ct_ids); do
+      name=$(mock_ct_attr "$id" name "")
+      status=$(mock_ct_attr "$id" status stopped)
+      [ "$first" = 1 ] || printf ','
+      first=0
+      printf '{"vmid":%s,"name":"%s","status":"%s","type":"lxc"}' \
+        "$id" "$(json_escape "$name")" "$status"
+    done
+    printf ']\n'
+    return 0
+  fi
+  printf '%-10s %-10s %-12s %-20s\n' "VMID" "Status" "Lock" "Name"
+  for id in $(mock_ct_ids); do
+    name=$(mock_ct_attr "$id" name "")
+    status=$(mock_ct_attr "$id" status stopped)
+    printf '%-10s %-10s %-12s %-20s\n' "$id" "$status" "" "$name"
+  done
+}
+
+pct_config() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "pct config <ctid>"
+  mock_require_ct "$id"
+  cat "$(mock_ct_conf "$id")"
+}
+
+pct_set() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "pct set <ctid> --options"
+  shift
+  mock_require_ct "$id"
+  local conf key value
+  conf=$(mock_ct_conf "$id")
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --delete)
+        shift
+        [ $# -gt 0 ] || mock_fail "missing value for --delete" 255
+        conf_del "$conf" "$1"
+        shift
+        ;;
+      --*)
+        key="${1#--}"
+        shift
+        [ $# -gt 0 ] || mock_fail "missing value for --$key" 255
+        value="$1"
+        shift
+        [ "$key" = "tags" ] && value=$(pve_normalize_tags "$value")
+        conf_set "$conf" "$key" "$value"
+        case "$key" in
+          hostname) mock_ct_attr_put "$id" name "$value" ;;
+          memory) mock_ct_attr_put "$id" mem "$value" ;;
+        esac
+        ;;
+      *) mock_fail "too many arguments" 255 ;;
+    esac
+  done
+  return 0
+}
+
+pct_exec_ip() { # ctid args...
+  local id="$1"
+  shift
+  local json=0 oneline=0 a
+  local cidr ip brd
+  cidr=$(mock_ct_attr "$id" ip "10.0.0.20/24")
+  ip="${cidr%/*}"
+  brd=$(awk -v ip="$ip" 'BEGIN {
+    split(ip, o, ".")
+    printf "%s.%s.%s.255", o[1], o[2], o[3]
+  }')
+  for a in "$@"; do
+    case "$a" in
+      -j|--json) json=1 ;;
+      -o|--oneline) oneline=1 ;;
+      *) : ;;
+    esac
+  done
+  if [ "$json" = 1 ]; then
+    printf '{"addr_info":[{"family":"inet","local":"%s","prefixlen":24,"broadcast":"%s","scope":"global"}],"ifname":"eth0","operstate":"UP"}\n' \
+      "$ip" "$brd"
+    return 0
+  fi
+  if [ "$oneline" = 1 ]; then
+    # ip -4 -o addr show scope global
+    printf '2: eth0    inet %s/24 brd %s scope global eth0\\       valid_lft forever preferred_lft forever\n' \
+      "$ip" "$brd"
+    return 0
+  fi
+  printf '1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n'
+  printf '    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n'
+  printf '    inet 127.0.0.1/8 scope host lo\n'
+  printf '       valid_lft forever preferred_lft forever\n'
+  printf '    inet6 ::1/128 scope host \n'
+  printf '       valid_lft forever preferred_lft forever\n'
+  printf '2: eth0@if7: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default qlen 1000\n'
+  printf '    link/ether aa:bb:cc:dd:ee:ff brd ff:ff:ff:ff:ff:ff link-netnsid 0\n'
+  printf '    inet %s/24 brd %s scope global eth0\n' "$ip" "$brd"
+  printf '       valid_lft forever preferred_lft forever\n'
+  printf '    inet6 fe80::be24:11ff:fe12:3456/64 scope link \n'
+  printf '       valid_lft forever preferred_lft forever\n'
+  return 0
+}
+
+pct_exec() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "pct exec <ctid> -- <command>"
+  shift
+  mock_require_ct "$id"
+  # optional option block and "--" separator, then the command
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift; break ;;
+      -*) shift ;;
+      *) break ;;
+    esac
+  done
+  if [ "$(mock_ct_status "$id")" != "running" ]; then
+    mock_fail "CT $id is not running" 1
+  fi
+  [ $# -gt 0 ] || mock_usage "pct exec <ctid> -- <command>"
+  case "$1" in
+    ip)
+      shift
+      pct_exec_ip "$id" "$@"
+      ;;
+    hostname)
+      shift
+      case "${1:-}" in
+        -I|--all-ip-addresses)
+          cidr=$(mock_ct_attr "$id" ip "10.0.0.20/24")
+          printf '%s \n' "${cidr%/*}"
+          ;;
+        -i|--ip-address)
+          cidr=$(mock_ct_attr "$id" ip "10.0.0.20/24")
+          printf '%s\n' "${cidr%/*}"
+          ;;
+        *)
+          mock_ct_attr "$id" name "ct-$id"
+          ;;
+      esac
+      ;;
+    *)
+      mock_fail "command not found in container (mock): $1" 127
+      ;;
+  esac
+}
+
+pct_status() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "pct status <ctid> [--output-format json]"
+  shift
+  mock_require_ct "$id"
+  local format="text" status
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --output-format) format="${2:-json}"; shift 2 ;;
+      --output-format=*) format="${1#--output-format=}"; shift ;;
+      *) shift ;;
+    esac
+  done
+  status=$(mock_ct_status "$id")
+  if [ "$format" = "json" ]; then
+    printf '{"status":"%s"}\n' "$status"
+  else
+    printf 'status: %s\n' "$status"
+  fi
+}
+
+pct_start() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "pct start <ctid>"
+  mock_require_ct "$id"
+  mock_ct_attr_put "$id" status running
+}
+
+pct_stop() {
+  local id="${1:-}"
+  [ -n "$id" ] || mock_usage "pct stop <ctid>"
+  mock_require_ct "$id"
+  mock_ct_attr_put "$id" status stopped
+}
+
+case "$sub" in
+  list) pct_list "$@" ;;
+  config) pct_config "$@" ;;
+  exec) pct_exec "$@" ;;
+  set) pct_set "$@" ;;
+  status) pct_status "$@" ;;
+  start) pct_start "$@" ;;
+  stop) pct_stop "$@" ;;
+  *) mock_fail "unknown command '$sub'" 255 ;;
+esac

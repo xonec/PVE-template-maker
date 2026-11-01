@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# mock `ip` for PVE template tests.
+#
+# Supported: `ip [-j] link show [dev NAME] [type bridge] [up]`,
+#            `ip [-j] [-4|-6] addr show [dev NAME]`
+# Links are derived from $MOCK_STATE/bridges/<name> (bridges) plus a fixed
+# loopback and one physical NIC (eth0) so pve-unified.sh's bridge discovery
+# behaves like it does on a real PVE node.
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call ip "$@"
+
+json=0
+family=""
+verb=""
+want=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -j|--json|-json) json=1; shift ;;
+    -4) family=4; shift ;;
+    -6) family=6; shift ;;
+    -o|--oneline|-br|--brief|-s|--stats|-d|--details|-a|--all|-n|--numeric|-r|--resolve)
+      shift
+      ;;
+    link|l) verb="link"; shift ;;
+    addr|address|a) verb="addr"; shift ;;
+    show|list|ls) shift ;;
+    *) want[${#want[@]}]="$1"; shift ;;
+  esac
+done
+
+[ -n "$verb" ] || mock_usage "ip [-j] link|addr show [dev NAME] [type bridge]"
+
+# index and kind for every modeled link
+link_index() { # name kind
+  local name="$1" kind="$2" i=3 b
+  case "$kind" in
+    lo) printf '1' ; return ;;
+    ether) printf '2'; return ;;
+  esac
+  for b in $(mock_bridge_names); do
+    if [ "$b" = "$name" ]; then
+      printf '%s' "$i"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  printf '0'
+}
+
+link_kind() { # name -> lo|ether|bridge|"" 
+  case "$1" in
+    lo) printf 'lo' ;;
+    eth0) printf 'ether' ;;
+    *)
+      if mock_bridge_exists "$1"; then printf 'bridge'; fi
+      ;;
+  esac
+}
+
+link_flags() {
+  case "$1" in
+    lo) printf 'LOOPBACK,UP,LOWER_UP' ;;
+    *) printf 'BROADCAST,MULTICAST,UP,LOWER_UP' ;;
+  esac
+}
+
+link_mac() { # name index
+  local idx
+  idx=$(link_index "$1" "$2")
+  case "$2" in
+    lo) printf '00:00:00:00:00:00' ;;
+    ether) printf 'aa:bb:cc:dd:ee:ff' ;;
+    *) printf '02:00:00:00:00:%02x' "$idx" ;;
+  esac
+}
+
+emit_link_block() { # name kind
+  local name="$1" kind="$2" idx state qdisc
+  idx=$(link_index "$name" "$kind")
+  case "$kind" in
+    lo) state="UNKNOWN"; qdisc="noqueue" ;;
+    ether) state="UP"; qdisc="pfifo_fast" ;;
+    *) state="UP"; qdisc="noqueue" ;;
+  esac
+  printf '%s: %s: <%s> mtu %s qdisc %s state %s mode DEFAULT group default qlen 1000\n' \
+    "$idx" "$name" "$(link_flags "$kind")" \
+    "$( [ "$kind" = "lo" ] && printf '65536' || printf '1500' )" "$qdisc" "$state"
+  if [ "$kind" = "lo" ]; then
+    printf '    link/loopback %s brd 00:00:00:00:00:00\n' "$(link_mac "$name" "$kind")"
+  else
+    printf '    link/ether %s brd ff:ff:ff:ff:ff:ff\n' "$(link_mac "$name" "$kind")"
+  fi
+}
+
+link_json() { # name kind -> compact object
+  local name="$1" kind="$2" idx
+  idx=$(link_index "$name" "$kind")
+  printf '{"ifindex":%s,"ifname":"%s","flags":["BROADCAST","MULTICAST","UP"],"mtu":%s,"operstate":"%s","linkmode":"DEFAULT","group":"default","txqlen":1000,"address":"%s","broadcast":"ff:ff:ff:ff:ff:ff"}' \
+    "$idx" "$(json_escape "$name")" \
+    "$( [ "$kind" = "lo" ] && printf '65536' || printf '1500' )" \
+    "$( [ "$kind" = "lo" ] && printf 'UNKNOWN' || printf 'UP' )" \
+    "$(link_mac "$name" "$kind")"
+}
+
+emit_addr_block() { # name kind
+  local name="$1" kind="$2" idx cidr ip prefix brd
+  idx=$(link_index "$name" "$kind")
+  if [ "$kind" = "lo" ]; then
+    printf '%s: %s: <%s> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n' \
+      "$idx" "$name" "$(link_flags "$kind")"
+    printf '    link/loopback %s brd 00:00:00:00:00:00\n' "$(link_mac "$name" "$kind")"
+    printf '    inet 127.0.0.1/8 scope host lo\n'
+    printf '       valid_lft forever preferred_lft forever\n'
+    return 0
+  fi
+  printf '%s: %s: <%s> mtu 1500 qdisc noqueue state UP group default qlen 1000\n' \
+    "$idx" "$name" "$(link_flags "$kind")"
+  printf '    link/ether %s brd ff:ff:ff:ff:ff:ff\n' "$(link_mac "$name" "$kind")"
+  if [ "$kind" = "ether" ]; then
+    return 0
+  fi
+  cidr=$(mock_bridge_addr "$name")
+  ip="${cidr%/*}"
+  prefix="${cidr#*/}"
+  if [ "$prefix" = "24" ]; then
+    brd=$(awk -v ip="$ip" 'BEGIN { split(ip, o, "."); printf "%s.%s.%s.255", o[1], o[2], o[3] }')
+    printf '    inet %s/%s brd %s scope global %s\n' "$ip" "$prefix" "$brd" "$name"
+  else
+    printf '    inet %s/%s scope global %s\n' "$ip" "$prefix" "$name"
+  fi
+  printf '       valid_lft forever preferred_lft forever\n'
+}
+
+addr_json() { # name kind
+  local name="$1" kind="$2" idx cidr ip prefix
+  idx=$(link_index "$name" "$kind")
+  if [ "$kind" = "lo" ]; then
+    printf '{"ifindex":%s,"ifname":"%s","flags":["LOOPBACK","UP"],"mtu":65536,"operstate":"UNKNOWN","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8,"scope":"host"}]}' \
+      "$idx" "$(json_escape "$name")"
+    return 0
+  fi
+  if [ "$kind" = "ether" ]; then
+    printf '{"ifindex":%s,"ifname":"%s","flags":["BROADCAST","MULTICAST","UP"],"mtu":1500,"operstate":"UP","addr_info":[]}' \
+      "$idx" "$(json_escape "$name")"
+    return 0
+  fi
+  cidr=$(mock_bridge_addr "$name")
+  ip="${cidr%/*}"
+  prefix="${cidr#*/}"
+  printf '{"ifindex":%s,"ifname":"%s","flags":["BROADCAST","MULTICAST","UP"],"mtu":1500,"operstate":"UP","addr_info":[{"family":"inet","local":"%s","prefixlen":%s,"scope":"global"}]}' \
+    "$idx" "$(json_escape "$name")" "$(json_escape "$ip")" "$prefix"
+}
+
+# resolve requested devices
+selected=()
+dev_filter=""
+type_filter=""
+up_filter=0
+i=0
+while [ "$i" -lt "${#want[@]}" ]; do
+  case "${want[$i]}" in
+    dev)
+      i=$((i + 1))
+      [ "$i" -lt "${#want[@]}" ] && dev_filter="${want[$i]}"
+      ;;
+    type)
+      i=$((i + 1))
+      [ "$i" -lt "${#want[@]}" ] && type_filter="${want[$i]}"
+      ;;
+    up) up_filter=1 ;;
+    *) [ -z "$dev_filter" ] && dev_filter="${want[$i]}" ;;
+  esac
+  i=$((i + 1))
+done
+
+all_names() {
+  printf 'lo\neth0\n'
+  mock_bridge_names
+}
+
+if [ -n "$dev_filter" ]; then
+  kind=$(link_kind "$dev_filter")
+  [ -n "$kind" ] || mock_fail "Device \"$dev_filter\" does not exist." 1
+  if [ -n "$type_filter" ] && [ "$type_filter" != "$kind" ]; then
+    # iproute2 style filter mismatch: no output (mock uses non-zero status so
+    # pve-unified.sh's fallback bridge detection works)
+    exit 1
+  fi
+  if [ "$verb" = "link" ]; then
+    if [ "$json" = 1 ]; then
+      printf '['
+      link_json "$dev_filter" "$kind"
+      printf ']\n'
+    else
+      emit_link_block "$dev_filter" "$kind"
+    fi
+  else
+    if [ "$json" = 1 ]; then
+      printf '['
+      addr_json "$dev_filter" "$kind"
+      printf ']\n'
+    else
+      emit_addr_block "$dev_filter" "$kind"
+    fi
+  fi
+  exit 0
+fi
+
+names=()
+if [ -n "$type_filter" ]; then
+  for n in $(mock_bridge_names); do
+    [ "$type_filter" = "bridge" ] && names[${#names[@]}]="$n"
+  done
+else
+  for n in $(all_names); do
+    names[${#names[@]}]="$n"
+  done
+fi
+
+if [ "$json" = 1 ]; then
+  printf '['
+  first=1
+  for n in "${names[@]}"; do
+    kind=$(link_kind "$n")
+    [ -z "$kind" ] && continue
+    [ "$first" = 1 ] || printf ','
+    first=0
+    if [ "$verb" = "link" ]; then link_json "$n" "$kind"; else addr_json "$n" "$kind"; fi
+  done
+  printf ']\n'
+else
+  for n in "${names[@]}"; do
+    kind=$(link_kind "$n")
+    [ -z "$kind" ] && continue
+    if [ "$verb" = "link" ]; then emit_link_block "$n" "$kind"; else emit_addr_block "$n" "$kind"; fi
+  done
+fi

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# mock `sleep`: PVE scripts sleep between IP polls; tests skip real delays.
+# (tests/run.sh itself keeps the real sleep available outside mock/bin.)
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call sleep "$@"
+exit 0

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# mock `hostname`: the PVE node name comes from $MOCK_STATE/node (default pve).
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call hostname "$@"
+
+node=$(mock_node)
+case "${1:-}" in
+  -s|--short) printf '%s\n' "$node" ;;
+  -f|--fqdn|--long) printf '%s.localdomain\n' "$node" ;;
+  -d|--domain) printf 'localdomain\n' ;;
+  -i|--ip-address) printf '10.0.0.1\n' ;;
+  -I|--all-ip-addresses) printf '10.0.0.1 \n' ;;
+  *) printf '%s\n' "$node" ;;
+esac
+exit 0

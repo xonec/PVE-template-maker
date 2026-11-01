@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mock-regression:
+    name: mock regression (no PVE needed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq bc shellcheck
+
+      - name: Bash syntax check
+        run: |
+          set -euo pipefail
+          bash -n pve-unified.sh
+          for f in tests/run.sh tests/lib/*.sh tests/cases/*.sh tests/mock/bin/* tests/mock/lib/*.sh; do
+            printf 'bash -n %s\n' "$f"
+            bash -n "$f"
+          done
+
+      - name: ShellCheck (warning level, tests/ only)
+        run: |
+          shellcheck --version
+          shellcheck -S warning \
+            tests/run.sh tests/lib/*.sh tests/cases/*.sh \
+            tests/mock/bin/* tests/mock/lib/*.sh
+
+      - name: Mock regression suite (TAP)
+        run: bash tests/run.sh --verbose
