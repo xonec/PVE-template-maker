@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# mock `id`: uid comes from $MOCK_STATE/uid (default 0 = root, like PVE).
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call id "$@"
+
+uid=$(mock_uid)
+if [ "$uid" = "0" ]; then uname="root"; else uname="user$uid"; fi
+
+[ $# -gt 0 ] || { printf 'uid=%s(%s) gid=%s(%s) groups=%s(%s)\n' "$uid" "$uname" "$uid" "$uname" "$uid" "$uname"; exit 0; }
+
+case "$1" in
+  -u|--user)
+    shift
+    if [ $# -gt 0 ]; then
+      case "$1" in
+        root|0) printf '0\n' ;;
+        *) printf '1000\n' ;;
+      esac
+    else
+      printf '%s\n' "$uid"
+    fi
+    ;;
+  -g|--group) printf '0\n' ;;
+  -G|--groups) printf '0\n' ;;
+  -n|--name)
+    shift
+    if [ $# -gt 0 ]; then printf '%s\n' "$1"; else printf '%s\n' "$uname"; fi
+    ;;
+  -un|-nu)
+    shift
+    if [ $# -gt 0 ]; then printf '%s\n' "$1"; else printf '%s\n' "$uname"; fi
+    ;;
+  *)
+    printf 'uid=%s(%s) gid=%s(%s) groups=%s(%s)\n' "$uid" "$uname" "$uid" "$uname" "$uid" "$uname"
+    ;;
+esac
+exit 0

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# mock `clear`: log it, emit nothing (TERM=dumb friendly).
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call clear "$@"
+exit 0

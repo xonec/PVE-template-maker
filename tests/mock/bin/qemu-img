@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# mock `qemu-img` for PVE template tests.
+#
+# Supported: `qemu-img info [--output=json] <file>`.
+# The virtual size is taken from $MOCK_STATE/qemu_img_virtual_size (bytes,
+# default 10 GiB) and the actual size from the file itself, mirroring how
+# PVE 8's qm templates report disk sizes.  qcow2 is assumed for all files.
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call qemu-img "$@"
+
+sub="$1"
+[ -n "$sub" ] || mock_usage "qemu-img <command> [args]"
+shift
+
+case "$sub" in
+  info)
+    format="human"
+    file=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --output=json) format="json"; shift ;;
+        --output=*) format="${1#--output=}"; shift ;;
+        --output) format="${2:-human}"; shift 2 ;;
+        -*) shift ;;
+        *) file="$1"; shift ;;
+      esac
+    done
+    [ -n "$file" ] || mock_usage "qemu-img info [--output=json] <file>"
+    if [ ! -f "$file" ]; then
+      mock_fail "qemu-img: Could not open '$file': No such file or directory" 1
+    fi
+    virtual=$(file_get "$MOCK_STATE/qemu_img_virtual_size" 10737418240)
+    actual=$(wc -c < "$file" | tr -d ' ')
+    if [ "$format" = "json" ]; then
+      printf '{"virtual-size":%s,"filename":"%s","cluster-size":65536,"format":"qcow2","actual-size":%s,"dirty-flag":false}\n' \
+        "$virtual" "$(json_escape "$file")" "$actual"
+    else
+      gib=$(awk -v b="$virtual" 'BEGIN { printf "%.2f", b / 1073741824 }')
+      printf 'image: %s\n' "$file"
+      printf 'file format: qcow2\n'
+      printf 'virtual size: %s GiB (%s bytes)\n' "$gib" "$virtual"
+      printf 'disk size: %s KiB\n' "$((actual / 1024))"
+      printf 'cluster_size: 65536\n'
+      printf 'Format specific information:\n'
+      printf '    compat: 1.1\n'
+      printf '    compression type: zlib\n'
+      printf '    lazy refcounts: false\n'
+    fi
+    ;;
+  *) mock_fail "mock qemu-img only implements 'info' (got '$sub')" 255 ;;
+esac

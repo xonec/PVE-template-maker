@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# mock `curl` for PVE template tests (v2 readiness).
+#
+# Behaviour is driven by $MOCK_STATE/curl_mode: ok writes a fake qcow2,
+# fail exits 22 with a curl-style error.  No network access is performed.
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call curl "$@"
+
+outfile=""
+url=""
+head=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--output|-O) outfile="${2-}"; [ "$1" = "-O" ] && outfile="-"; shift 2 ;;
+    -o-|--output=-) outfile="-"; shift ;;
+    --output=*) outfile="${1#--output=}"; shift ;;
+    -o*) outfile="${1#-o}"; shift ;;
+    -w|--write-out|-H|--header|--data|-d|--data-raw|--data-binary|-X|--request|--user|-u|-m|--max-time|--retry|--retry-delay|-C|--continue-at)
+      shift 2
+      ;;
+    --max-time=*|--retry=*|--retry-delay=*|--write-out=*|--header=*|--data=*|-w*|-H*) shift ;;
+    --silent|--show-error|--location|--fail|--insecure|--globoff) shift ;;
+    *)
+      case "$1" in
+        -*I*|-*i*) head=1 ;;
+      esac
+      case "$1" in
+        -*) shift ;;
+        *) url="$1"; shift ;;
+      esac
+      ;;
+  esac
+done
+
+mode=$(file_get "$MOCK_STATE/curl_mode" ok)
+if [ "$head" = 1 ] && [ "$mode" != "fail" ]; then
+  printf 'HTTP/2 200\n'
+  printf 'content-type: application/octet-stream\n'
+  printf 'content-length: 73400320\n'
+  printf 'last-modified: Mon, 01 Jan 2024 00:00:00 GMT\n'
+  printf '\n'
+  exit 0
+fi
+if [ "$mode" = "fail" ]; then
+  printf 'curl: (22) The requested URL returned error: 404\n' >&2
+  exit 22
+fi
+
+if [ -z "$outfile" ]; then
+  outfile="-"
+  [ -n "$url" ] && outfile="${url##*/}"
+fi
+if [ "$outfile" = "-" ]; then
+  printf 'QFI\373'
+  printf 'pve-mock-qcow2 image payload\n'
+else
+  parent=$(dirname "$outfile")
+  if [ ! -d "$parent" ]; then
+    printf "curl: (23) Failure writing output to destination\n" >&2
+    exit 23
+  fi
+  { printf 'QFI\373'; printf 'pve-mock-qcow2 image payload\n'; } > "$outfile" ||
+    mock_fail "curl: (23) Failure writing output to destination" 23
+fi
+exit 0

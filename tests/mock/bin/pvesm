@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# mock `pvesm` for PVE template tests.
+#
+# Supported: status (table + --output-format json), free.
+# Storage values are kept in KiB like the real `pvesm status` output.
+# `pvesm free <storage>` is an invalid call on real PVE (free expects a
+# volume ID), so by default it fails with "unable to parse volume ID".
+# A scenario can place any text in $MOCK_STATE/pvesm_free to simulate a
+# successful free-space query instead.
+
+MOCK_LIB_DIR=$(cd "$(dirname "$0")/../lib" && pwd)
+# shellcheck source=/dev/null
+. "$MOCK_LIB_DIR/common.sh"
+
+mock_call pvesm "$@"
+
+sub="$1"
+[ -n "$sub" ] || mock_usage "pvesm <command> [args]"
+shift
+
+pvesm_status() {
+  local format="table" name type status total used avail pct
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --output-format) format="${2:-json}"; shift 2 ;;
+      --output-format=*) format="${1#--output-format=}"; shift ;;
+      *) shift ;;
+    esac
+  done
+  if [ "$format" = "json" ]; then
+    printf '['
+    local first=1
+    for name in $(mock_storage_names); do
+      type=$(mock_storage_attr "$name" type dir)
+      status=$(mock_storage_attr "$name" status active)
+      total=$(mock_storage_attr "$name" total_kib 0)
+      used=$(mock_storage_attr "$name" used_kib 0)
+      avail=$((total - used))
+      [ "$first" = 1 ] || printf ','
+      first=0
+      printf '{"name":"%s","type":"%s","status":"%s","total":%s,"used":%s,"avail":%s}' \
+        "$(json_escape "$name")" "$(json_escape "$type")" "$(json_escape "$status")" \
+        "$total" "$used" "$avail"
+    done
+    printf ']\n'
+    return 0
+  fi
+  printf '%-15s %-8s %-8s %15s %17s %17s %8s\n' \
+    "Name" "Type" "Status" "Total" "Used" "Available" "%"
+  for name in $(mock_storage_names); do
+    type=$(mock_storage_attr "$name" type dir)
+    status=$(mock_storage_attr "$name" status active)
+    total=$(mock_storage_attr "$name" total_kib 0)
+    used=$(mock_storage_attr "$name" used_kib 0)
+    avail=$((total - used))
+    pct=$(awk -v u="$used" -v t="$total" 'BEGIN { if (t > 0) printf "%.2f", 100 * u / t; else printf "0.00" }')
+    printf '%-15s %-8s %-8s %15s %17s %17s %8s\n' \
+      "$name" "$type" "$status" "$total" "$used" "$avail" "$pct%"
+  done
+}
+
+pvesm_free() {
+  local vol="${1:-}"
+  [ -n "$vol" ] || mock_usage "pvesm free <volume>"
+  if [ -f "$MOCK_STATE/pvesm_free" ]; then
+    cat "$MOCK_STATE/pvesm_free"
+    return 0
+  fi
+  mock_fail "unable to parse volume ID '$vol'" 255
+}
+
+case "$sub" in
+  status) pvesm_status "$@" ;;
+  free) pvesm_free "$@" ;;
+  *) mock_fail "unknown command '$sub'" 255 ;;
+esac
